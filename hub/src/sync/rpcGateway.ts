@@ -655,6 +655,10 @@ export class RpcGateway {
         return await this.sessionRpc(sessionId, RPC_METHODS.ClearConversation, {}, 120_000) as { sessionId: string }
     }
 
+    async createBtw(sessionId: string): Promise<{ sessionId: string }> {
+        return await this.sessionRpc(sessionId, RPC_METHODS.CreateBtw, {}, 60_000) as { sessionId: string }
+    }
+
     async implementCodexPlan(sessionId: string, planId: string): Promise<ImplementCodexPlanResult> {
         return await this.sessionRpc(sessionId, RPC_METHODS.ImplementCodexPlan, { planId }, 60_000) as ImplementCodexPlanResult
     }

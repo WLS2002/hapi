@@ -91,6 +91,8 @@ import { useTranslation } from '@/lib/use-translation'
 import type { SendMessageAcceptance } from '@/hooks/mutations/useSendMessage'
 import { handoffComposerDraft, transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
 import { SessionHeader } from '@/components/SessionHeader'
+import { BtwPanel, BtwConversation } from '@/components/BtwPanel'
+import { isShortcutForSession } from '@/lib/chatShortcutScope'
 import { CursorMigrationBanner } from '@/components/CursorMigrationBanner'
 import { TeamPanel } from '@/components/TeamPanel'
 import { SessionStatusPanel } from '@/components/SessionStatusPanel'
@@ -587,7 +589,10 @@ function hasAbortableAgentRun(blocks: readonly ChatBlock[]): boolean {
     return false
 }
 
-type SessionChatProps = {
+export type SessionChatProps = {
+    btwEmbedded?: boolean
+    onToggleBtw?: () => void
+    btwOpen?: boolean
     readThroughRevision?: number
     api: ApiClient
     titleSuggestionAvailable?: boolean
@@ -669,7 +674,23 @@ type SessionChatProps = {
  * SessionChatInner.
  */
 export function SessionChat(props: SessionChatProps) {
-    return <SessionChatInner key={props.session.id} {...props} />
+    return <SessionChatWorkspace key={props.session.id} {...props} />
+}
+
+function SessionChatWorkspace(props: SessionChatProps) {
+    const [open, setOpen] = useState(false)
+    const hasBtw = !props.session.metadata?.codexSideParentId &&
+        (props.session.metadata?.capabilities?.btw || Boolean(props.session.metadata?.codexSideThreads?.length))
+    return <div className="flex h-full min-h-0 min-w-0">
+        <div className={`${open ? 'hidden lg:flex' : 'flex'} min-h-0 min-w-0 flex-1 flex-col`}>
+            <SessionChatInner {...props} onToggleBtw={hasBtw ? () => setOpen(value => !value) : undefined} btwOpen={open} />
+        </div>
+        {hasBtw && open ? <aside className="h-full min-h-0 w-full shrink-0 border-l border-[var(--app-divider)] lg:w-[min(48%,36rem)]">
+            <BtwPanel api={props.api} parent={props.session} onClose={() => setOpen(false)} onCreated={() => { void props.onRefresh() }}
+                renderConversation={id => <BtwConversation key={id} id={id} onBack={() => setOpen(false)}
+                    renderChat={chat => <SessionChatInner key={chat.session.id} {...chat} btwEmbedded />} />} />
+        </aside> : null}
+    </div>
 }
 
 function SessionChatInner(props: SessionChatProps) {
@@ -724,6 +745,7 @@ function SessionChatInner(props: SessionChatProps) {
         await onForkConversation(rewindForkFallback)
         setRewindForkFallback(null)
     }, [onForkConversation, rewindForkFallback])
+    const isBtw = Boolean(props.session.metadata?.codexSideParentId)
     const sessionInactive = !props.session.active
     const inactiveCanResume = inactiveSessionCanResume(
         props.session,
@@ -839,6 +861,7 @@ function SessionChatInner(props: SessionChatProps) {
      */
     useEffect(() => {
         const onKeyDown = (e: globalThis.KeyboardEvent) => {
+            if (!isShortcutForSession(e.target, props.session.id)) return
             if (isScratchlistParking) return
             if (!isScratchlistToggleHotkey(e)) return
             if (isScratchlistHotkeyBlockedTarget(e.target)) return
@@ -857,6 +880,7 @@ function SessionChatInner(props: SessionChatProps) {
      */
     useEffect(() => {
         const onKeyDown = (e: globalThis.KeyboardEvent) => {
+            if (!isShortcutForSession(e.target, props.session.id)) return
             if (e.repeat) return
             if (!isDictateToggleHotkey(e)) return
             if (isDictateHotkeyBlockedTarget(e.target)) return
@@ -875,8 +899,11 @@ function SessionChatInner(props: SessionChatProps) {
      * the thread viewport.
      */
     useEffect(() => {
-        window.addEventListener('keydown', applyGlobalSelectAll)
-        return () => window.removeEventListener('keydown', applyGlobalSelectAll)
+        const handleSelectAll = (event: globalThis.KeyboardEvent) => {
+            if (isShortcutForSession(event.target, props.session.id)) applyGlobalSelectAll(event)
+        }
+        window.addEventListener('keydown', handleSelectAll)
+        return () => window.removeEventListener('keydown', handleSelectAll)
     }, [])
     /**
      * onSend wrapper: when scratchlist mode is on AND the submission is
@@ -1043,7 +1070,7 @@ function SessionChatInner(props: SessionChatProps) {
         sessionId: props.session.id,
         machineId: props.session.metadata?.machineId ?? null,
         preferSession: props.session.metadata?.capabilities?.concurrentClients === true,
-        enabled: agentFlavor === 'codex' && props.session.active && !controlledByUser
+        enabled: agentFlavor === 'codex' && props.session.active && !controlledByUser && !isBtw
     })
     const effectiveCodexServiceTier = agentFlavor === 'codex'
         ? getEffectiveCodexServiceTier(
@@ -2028,15 +2055,17 @@ function SessionChatInner(props: SessionChatProps) {
         attachmentOrderRef,
         onAbort: handleAbort,
         attachmentAdapter,
-        allowSendWhenInactive: true,
+        allowSendWhenInactive: !props.session.metadata?.codexSideParentId,
         pendingScheduleRef,
         pendingSendIntentRef,
     })
 
     return (
-        <div className="flex h-full min-h-0 flex-col">
-            <SessionHeader
+        <div data-session-chat={props.session.id} className="flex h-full min-h-0 flex-col">
+            {!props.btwEmbedded ? <SessionHeader
                 session={props.session}
+                onToggleBtw={props.onToggleBtw}
+                btwOpen={props.btwOpen}
                 serviceTier={effectiveCodexServiceTier}
                 onBack={props.onBack}
                 onToggleFiles={props.session.metadata?.path ? handleToggleFiles : undefined}
@@ -2065,7 +2094,7 @@ function SessionChatInner(props: SessionChatProps) {
                         }),
                     )
                 }}
-            />
+            /> : null}
 
             <CursorMigrationBanner metadata={props.session.metadata} />
 
@@ -2080,7 +2109,7 @@ function SessionChatInner(props: SessionChatProps) {
                 <div className="mx-auto w-full max-w-content bg-[var(--app-subtle-bg)] p-3 text-center text-sm text-[var(--app-hint)]">
                     {inactiveCanResume
                         ? t('session.inactive.autoResume')
-                        : t('session.inactive.cannotResume')}
+                        : props.session.metadata?.codexSideParentId ? t('btw.ended') : t('session.inactive.cannotResume')}
                 </div>
             ) : null}
 
@@ -2111,14 +2140,14 @@ function SessionChatInner(props: SessionChatProps) {
                         sessionId={props.session.id}
                         metadata={props.session.metadata}
                         disabled={sessionInactive}
-                        allowInactiveFork={sessionInactive && props.session.metadata?.flavor === 'codex'
+                        allowInactiveFork={!isBtw && sessionInactive && props.session.metadata?.flavor === 'codex'
                             && Boolean(props.session.metadata?.codexSessionId && props.session.metadata?.machineId)}
                         onRefresh={props.onRefresh}
                         onRetryMessage={props.onRetryMessage}
                         onContinuePlan={() => focusComposerRef.current?.()}
                         historyActionPending={historyActionPending}
-                        onForkConversation={controlledByUser && !sessionInactive ? undefined : onForkConversation}
-                        onRewindConversation={controlledByUser ? undefined : onRewindConversation}
+                        onForkConversation={isBtw || (controlledByUser && !sessionInactive) ? undefined : onForkConversation}
+                        onRewindConversation={isBtw || controlledByUser ? undefined : onRewindConversation}
                         isLatestCompletedBoundary={isLatestCompletedBoundary}
                         onViewModeChange={props.onViewModeChange}
                         onJumpToTail={props.onJumpToTail}
@@ -2224,7 +2253,7 @@ function SessionChatInner(props: SessionChatProps) {
                         }}
                         attachmentOrderRef={attachmentOrderRef}
                         resolveSessionMentionTooltip={resolveSessionMentionTooltip}
-                        disabled={props.isSending}
+                        disabled={props.isSending || (isBtw && (sessionInactive || Boolean(props.session.metadata?.codexSideEnded)))}
                         pendingSchedule={pendingSchedule}
                         onSchedule={updatePendingSchedule}
                         onClearSchedule={() => updatePendingSchedule(null)}
@@ -2284,7 +2313,7 @@ function SessionChatInner(props: SessionChatProps) {
                                 : claudeEffortOptions
                         }
                         active={props.session.active}
-                        allowSendWhenInactive
+                        allowSendWhenInactive={!props.session.metadata?.codexSideParentId}
                         resolveSessionIdForVoice={props.resolveSessionIdForVoice}
                         onVoiceSessionResolved={props.onVoiceSessionResolved}
                         onResumeStoredDraft={() => handleSend('', undefined, null)}
@@ -2297,7 +2326,7 @@ function SessionChatInner(props: SessionChatProps) {
                         contextModel={reduced.latestUsage?.model ?? props.session.model}
                         controlledByUser={controlledByUser}
                         onCollaborationModeChange={
-                            codexCollaborationModeSupported && props.session.active && !controlledByUser
+                            codexCollaborationModeSupported && props.session.active && !controlledByUser && !isBtw
                                 ? handleCollaborationModeChange
                                 : undefined
                         }
@@ -2307,7 +2336,7 @@ function SessionChatInner(props: SessionChatProps) {
                                 : undefined
                         }
                         onPermissionModeChange={
-                            agentFlavor === 'copilot' && controlledByUser
+                            isBtw || (agentFlavor === 'copilot' && controlledByUser)
                                 ? undefined
                                 : handlePermissionModeChange
                         }
@@ -2337,7 +2366,7 @@ function SessionChatInner(props: SessionChatProps) {
                         }
                         onModelChange={
                             agentFlavor === 'codex'
-                                ? (props.session.active && !controlledByUser && !codexModelsState.error ? handleModelChange : undefined)
+                                ? (props.session.active && !controlledByUser && !codexModelsState.error && !isBtw ? handleModelChange : undefined)
                                 : agentFlavor === 'cursor'
                                     ? (props.session.active
                                         && !controlledByUser
@@ -2370,6 +2399,7 @@ function SessionChatInner(props: SessionChatProps) {
                         }
                         onModelReasoningEffortChange={
                             (agentFlavor === 'codex' || agentFlavor === 'opencode')
+                                && !isBtw
                                 && props.session.active
                                 && !controlledByUser
                                 && (agentFlavor !== 'opencode' || opencodeReasoningEffortState.options.length > 0)
@@ -2388,7 +2418,7 @@ function SessionChatInner(props: SessionChatProps) {
                                 : handleEffortChange
                         }
                         serviceTier={effectiveCodexServiceTier}
-                        onServiceTierChange={
+                        onServiceTierChange={isBtw ? undefined :
                             agentFlavor === 'codex'
                                 && props.session.active
                                 && !controlledByUser

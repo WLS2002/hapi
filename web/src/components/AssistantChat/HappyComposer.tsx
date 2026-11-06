@@ -1,3 +1,4 @@
+import { isShortcutForSession } from '@/lib/chatShortcutScope'
 import {
     getCodexCollaborationModeOptions,
     getCopilotAgentModeOptions,
@@ -1481,6 +1482,7 @@ export function HappyComposer(props: {
 
     useEffect(() => {
         const handleGlobalKeyDown = (e: globalThis.KeyboardEvent) => {
+            if (sessionId && !isShortcutForSession(e.target, sessionId)) return
             // Pi needs { provider, modelId } to disambiguate duplicate model IDs,
             // but this generic cycler only emits a bare modelId (or null), which
             // would lose the provider and can pick the wrong cached match or clear

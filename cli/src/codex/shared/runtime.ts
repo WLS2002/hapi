@@ -11,9 +11,11 @@ import { getProcessStartMarker, killProcessByChildProcess } from '@/utils/proces
 import { logger } from '@/ui/logger';
 import { CodexAppServerClient, isIndeterminateError } from '../codexAppServerClient';
 import { codexHome, saveRuntime, runtimeDirectory, runtimeAuthHash, findColdBinding, withThreadOwnership, type CodexRuntimeRecord } from './registry';
-import { startCodexGateway, record, string, type Envelope } from './gateway';
+import { startCodexGateway, record, string, type Envelope, type GatewayPeer } from './gateway';
 import { resolveSharedCodex, sharedLaunchConfig, initializeSharedClient, checkSharedCapabilities, takeReservedSessionId, type SharedLaunchOptions } from './launch';
 import { SharedCodexRoot } from './root';
+import { SharedCodexSide, SIDE_BOUNDARY, SIDE_INSTRUCTIONS } from './side';
+import { buildHapiMcpBridge } from '../utils/buildHapiMcpBridge';
 import { buildForkSessionSummary } from '@hapi/protocol';
 
 export type RuntimeReady = { sessionId: string; runtime: CodexRuntimeRecord };
@@ -74,6 +76,9 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
     const ending = new Set<SharedCodexRoot>();
     const roots = new Map<string, SharedCodexRoot>();
     const prepared = new Set<SharedCodexRoot>();
+    const sides = new Set<SharedCodexSide>();
+    const sideReservations = new Map<string, SharedCodexSide>();
+    const terminalSides = new Map<SharedCodexSide, string>();
     const reservations = new Map<string, Reservation>();
     const runtime: CodexRuntimeRecord = { id, pid: process.pid, marker: getProcessStartMarker(process.pid) ?? '',
         endpoint: '', command: command.command, args: command.args, codexHome: home, hub: configuration.apiUrl, authHash: runtimeAuthHash(), sessions: {} };
@@ -134,6 +139,7 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
                     new Promise<void>(resolve => { timer = setTimeout(resolve, 5_000); })
                 ]);
             } finally { clearTimeout(timer); }
+            await Promise.allSettled([...sides].map(side => side.close()));
             await control.disconnect();
             if (server && server.exitCode === null && server.signalCode === null) {
                 if (!await killProcessByChildProcess(server)) throw new Error('Codex engine did not stop; ownership retained for orphan recovery');
@@ -157,6 +163,7 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
         if (!roots.has(root.threadId) || ending.has(root)) return;
         ending.add(root);
         try { if (nativeArchive) await root.client.request('thread/archive', { threadId: root.threadId }); } catch (error) { ending.delete(root); throw error; }
+        await Promise.allSettled([...sides].filter(side => side.session.getMetadata()?.codexSideParentId === root.session.sessionId).map(async side => { await side.end(); await side.close(); }));
         roots.delete(root.threadId);
         runtime.sessions[root.session.sessionId].active = false; await persist();
         // Let the RPC acknowledgement leave both gateway and hub sockets before detach.
@@ -199,11 +206,54 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
                 agentState: { controlledByUser: false },
             });
         const root = new SharedCodexRoot(bootstrap, { directory: join(runtimeDirectory(), 'queues'), generation: id, endpoint: upstream, token: upstreamToken,
-            settingsFor: threadId => nativeSettings.get(threadId), create, end });
+            settingsFor: threadId => nativeSettings.get(threadId), create, end, createSide });
         prepared.add(root);
         try { assertRunning(); await root.prepare(); assertRunning(); return root; }
         catch (error) { await root.close(!stopping && !existingSessionId); prepared.delete(root); throw error; }
     };
+    const prepareSide = async (parent: SharedCodexRoot, peer?: GatewayPeer, connection?: string) => {
+        assertRunning();
+        const bootstrap = await bootstrapSession({ flavor: 'codex', startedBy: options.startedBy ?? 'terminal',
+            workingDirectory: parent.bootstrap.workingDirectory, exportSessionEnv: false, reportStarted: false,
+            metadataOverrides: { codexSideParentId: parent.session.sessionId, name: 'BTW', titleLocked: true,
+                capabilities: { concurrentClients: true, terminal: false } }, agentState: { controlledByUser: false } });
+        const client = new CodexAppServerClient({ endpoint: upstream, token: upstreamToken, cwd: bootstrap.workingDirectory });
+        const bridge = await buildHapiMcpBridge(bootstrap.session, { exportSessionEnv: false, emitTitleSummary: false,
+            skillLookup: { workingDirectory: bootstrap.workingDirectory, flavor: 'codex' } });
+        const side = new SharedCodexSide(bootstrap.session, peer ?? client, join(runtimeDirectory(), 'sides'), id, async () => {
+            client.setTransportAbandonedHandler(null); await client.disconnect(); bridge.server.stop(); sides.delete(side); terminalSides.delete(side); peer?.release();
+        });
+        sides.add(side);
+        if (peer && connection) { peer.retain(); terminalSides.set(side, connection); }
+        client.setNotificationHandler((method, params) => { void side.notification(method, params).catch(error => logger.debug('[Codex BTW] projection', error)); });
+        client.setServerRequestHandler(request => side.receive(request));
+        client.setTransportAbandonedHandler(() => { void side.close().catch(error => logger.debug('[Codex BTW] disconnect', error)); });
+        try { if (!peer) await initializeSharedClient(client); assertRunning(); }
+        catch (error) { await side.close(); throw error; }
+        const config = (params: Record<string, unknown>) => ({ ...params, config: { ...record(params.config),
+            'mcp_servers.hapi': bridge.mcpServers.hapi, 'shell_environment_policy.set.HAPI_SESSION_ID': bootstrap.session.sessionId } });
+        return { side, config };
+    };
+    const bindSide = async (side: SharedCodexSide, parent: SharedCodexRoot, response: Record<string, unknown>) => {
+        await side.bind(response);
+        parent.session.updateMetadata(metadata => ({ ...metadata, codexSideThreads: [
+            ...metadata.codexSideThreads ?? [], { sessionId: side.session.sessionId, threadId: side.threadId }
+        ] }));
+        await parent.session.flush();
+    };
+    const createSide = (parent: SharedCodexRoot): Promise<{ sessionId: string }> => operation(async () => {
+        const { side, config } = await prepareSide(parent);
+        try {
+            const params = parent.freshParams();
+            const response = record(await side.client.request('thread/fork', config({ ...params, threadId: parent.threadId,
+                ephemeral: true, excludeTurns: true, config: { ...record(params.config), daybreak_enabled: false },
+                developerInstructions: `${params.developerInstructions ?? ''}\n\n${SIDE_INSTRUCTIONS}` })));
+            await side.client.request('thread/inject_items', { threadId: record(response.thread).id,
+                items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: SIDE_BOUNDARY }] }] });
+            await bindSide(side, parent, response);
+            return { sessionId: side.session.sessionId };
+        } catch (error) { await side.close(); throw error; }
+    });
     const reserveRecord = async (root: SharedCodexRoot, threadId: string) => {
         assertRunning();
         if (roots.has(threadId) || Object.entries(runtime.sessions).some(([sid, binding]) => sid !== root.session.sessionId && binding.active && binding.threadId === threadId)) {
@@ -257,10 +307,18 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
         }
     });
     const key = (connection: string, request: Envelope) => `${connection}:${typeof request.id}:${request.id}`;
-    const before = (request: Envelope, connection: string): Promise<Envelope> => operation(async () => {
+    const before = (request: Envelope, connection: string, peer: GatewayPeer): Promise<Envelope> => operation(async () => {
         const params = record(request.params);
         if (['thread/revert', 'thread/rollback'].includes(request.method ?? '')) {
             throw new Error('In-place rewind is unavailable with concurrent HAPI clients. Use /fork or Fork at message instead.');
+        }
+        if (request.method === 'thread/fork' && params.ephemeral === true) {
+            if (request.id === undefined) throw new Error('BTW fork requires a request ID');
+            const parent = roots.get(string(params.threadId) ?? '');
+            if (!parent) throw new Error('Create BTW from an active main HAPI conversation');
+            const { side, config } = await prepareSide(parent, peer, connection);
+            sideReservations.set(key(connection, request), side);
+            return { ...request, params: config(params) };
         }
         if (!['thread/start', 'thread/resume', 'thread/fork'].includes(request.method ?? '') || params.ephemeral === true) return request;
         if (request.id === undefined) throw new Error('Lifecycle operations require a JSON-RPC request ID');
@@ -298,6 +356,17 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
         } catch (error) { prepared.delete(root); await root.close(true); throw error; }
     });
     const after = (request: Envelope, response: Envelope, connection: string): Promise<void | Envelope[]> => operation(async () => {
+        const side = sideReservations.get(key(connection, request)); sideReservations.delete(key(connection, request));
+        if (side) {
+            const parent = roots.get(string(record(request.params).threadId) ?? '');
+            if (response.error || !parent) { await side.close(); return; }
+            await bindSide(side, parent, record(response.result));
+            return;
+        }
+        if (request.method === 'thread/unsubscribe' && !response.error) {
+            const target = string(record(request.params).threadId);
+            for (const [side, owner] of terminalSides) if (owner === connection && side.threadId === target) await side.close();
+        }
         const reservation = reservations.get(key(connection, request)); reservations.delete(key(connection, request));
         if (reservation) {
             if (response.error) {
@@ -348,7 +417,16 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
         await checkSharedCapabilities(control);
         assertRunning();
         gateway = await startCodexGateway({ upstream, upstreamToken, path: process.platform === 'win32' ? undefined : join(sockets, 'clients.sock'), token,
-            hooks: { before, after, disconnected: connection => {
+            hooks: { before, after, observe: async (message, connection) => {
+                for (const [side, owner] of terminalSides) {
+                    if (owner !== connection) continue;
+                    if (message.id !== undefined) side.receive({ id: message.id, method: message.method!, params: message.params });
+                    else await side.notification(message.method!, message.params);
+                }
+            }, disconnected: connection => {
+                for (const [side, owner] of terminalSides) if (owner === connection) {
+                    void side.close().catch(error => logger.debug('[Codex BTW] terminal transport lost', error));
+                }
                 for (const [key, reservation] of reservations) {
                     if (!key.startsWith(`${connection}:`)) continue;
                     reservation.root.session.sendSessionEvent({ type: 'message', message: 'Native lifecycle outcome is unknown after transport loss. Do not retry blindly; inspect the shared runtime log.' });

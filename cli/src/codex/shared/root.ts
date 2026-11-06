@@ -31,6 +31,7 @@ export type RootHost = {
     settingsFor(threadId: string): Record<string, unknown> | undefined;
     create(method: 'thread/start' | 'thread/fork', params: Record<string, unknown>, parent?: SharedCodexRoot): Promise<SharedCodexRoot>;
     end(root: SharedCodexRoot, nativeArchive?: boolean): Promise<void>;
+    createSide?(root: SharedCodexRoot): Promise<{ sessionId: string }>;
 };
 const SettingsSchema = z.object({
     permissionMode: z.enum(['default', 'read-only', 'autoReview', 'yolo']).optional(),
@@ -230,7 +231,7 @@ export class SharedCodexRoot {
             async () => record(await this.client.request('thread/read', { threadId, includeTurns: false })).thread,
             (threadId, item) => this.asyncQuestions.observeItem(threadId, item));
         this.session.updateMetadata(metadata => ({ ...metadata, codexSessionId: threadId, capabilities: {
-            ...metadata.capabilities, concurrentClients: true, terminal: true,
+            ...metadata.capabilities, concurrentClients: true, terminal: true, btw: Boolean(this.host.createSide),
             // In-place rewind needs a native + hub commit barrier. Do not
             // advertise a destructive operation we cannot make atomic yet.
             conversationHistory: { forkCurrent: true, forkAtMessage: true, rewindToMessage: false }
@@ -548,6 +549,7 @@ export class SharedCodexRoot {
         });
         rpc.registerHandler(RPC_METHODS.Switch, async () => { throw new Error('control_mode_not_applicable'); });
         rpc.registerHandler(RPC_METHODS.HandoffLocal, async () => { throw new Error('control_mode_not_applicable'); });
+        if (this.host.createSide) rpc.registerHandler(RPC_METHODS.CreateBtw, async () => this.host.createSide!(this));
         rpc.registerHandler(RPC_METHODS.Abort, async () => {
             const turnId = this.currentTurn;
             if (turnId) await this.client.request('turn/interrupt', { threadId: this.threadId, turnId });

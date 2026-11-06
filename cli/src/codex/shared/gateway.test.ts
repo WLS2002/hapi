@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { WebSocket, WebSocketServer } from 'ws';
 import { CodexAppServerClient } from '../codexAppServerClient';
-import { startCodexGateway, type Envelope } from './gateway';
+import { startCodexGateway, type Envelope, type GatewayPeer } from './gateway';
 
 async function fixture(after: (request: Envelope, response: Envelope, connection: string) => Promise<void>) {
     const engine = new WebSocketServer({ port: 0, host: '127.0.0.1' });
@@ -16,7 +16,7 @@ async function fixture(after: (request: Envelope, response: Envelope, connection
         });
     });
     const port = (engine.address() as { port: number }).port;
-    const before = vi.fn(async (value: Envelope) => value);
+    const before = vi.fn(async (value: Envelope, _connection: string, _peer: GatewayPeer) => value);
     const gateway = await startCodexGateway({ upstream: `ws://127.0.0.1:${port}`, token: 'secret', hooks: {
         before, after, control: async () => ({})
     } });
@@ -74,6 +74,21 @@ describe('native gateway barriers', () => {
             await vi.waitFor(() => expect(f.before).toHaveBeenCalled()); client.close(); release();
             await vi.waitFor(() => expect(bound).toHaveBeenCalledOnce());
         } finally { release(); await f.close(); }
+    });
+    it('resolves internal side controls while a lifecycle response is awaiting them', async () => {
+        let peer!: GatewayPeer;
+        let controlResult: unknown;
+        const f = await fixture(async () => { controlResult = await peer.request('thread/unsubscribe', 'side'); });
+        f.before.mockImplementation(async (value, _connection, channel) => { peer = channel; return value; });
+        try {
+            const client = await f.connect();
+            const replies: Envelope[] = [];
+            client.on('message', raw => replies.push(JSON.parse(raw.toString())));
+            client.send(JSON.stringify({ id: 1, method: 'thread/archive', params: 'main' }));
+            await vi.waitFor(() => expect(replies).toHaveLength(1), { timeout: 1_000 });
+            expect(controlResult).toEqual({ thread: { id: 'side' } });
+            expect(replies[0]).toEqual({ id: 1, result: { thread: { id: 'main' } } });
+        } finally { await f.close(); }
     });
     it('rejects unauthenticated loopback connections', async () => {
         const f = await fixture(async () => {});

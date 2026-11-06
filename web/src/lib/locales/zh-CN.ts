@@ -1,4 +1,19 @@
 export default {
+  'btw.back': '返回主对话',
+  'btw.conversations': 'BTW 旁支',
+  'btw.noConversations': '暂无旁支',
+  'btw.new': '新建 BTW',
+  'btw.creating': '创建中…',
+  'btw.createFailed': '未能创建 BTW，请重试。',
+  'btw.emptyTitle': '主任务继续，随时开个旁支问问',
+  'btw.emptyDescription': '基于当前上下文创建 BTW，不打断主任务。',
+  'btw.ended': 'BTW 已结束 · 可查看历史',
+  'btw.working': '处理中…',
+  'btw.ready': '可以提问',
+  'btw.end': '结束 BTW',
+  'btw.ending': '结束中…',
+  'btw.endDescription': '结束这个临时旁支？消息记录会保留，主任务继续运行。',
+
   // Loading states
   'loading': '加载中…',
   'authorizing': '认证中…',

@@ -43,6 +43,7 @@ export function inactiveSessionCanResume(
     userMessageCount: number,
     cursorChatOnDisk?: boolean,
 ): boolean {
+    if (session.metadata?.codexSideParentId) return false
     if (session.active) {
         return true
     }

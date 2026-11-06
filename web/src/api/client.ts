@@ -739,6 +739,10 @@ export class ApiClient {
         )
     }
 
+    async createBtw(sessionId: string): Promise<{ sessionId: string }> {
+        return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/btw`, { method: 'POST' })
+    }
+
     async abortSession(sessionId: string): Promise<void> {
         await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/abort`, {
             method: 'POST',

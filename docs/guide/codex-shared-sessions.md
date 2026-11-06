@@ -97,6 +97,30 @@ Each root has its own HAPI socket, MCP bridge and shell `HAPI_SESSION_ID`.
 Child-agent traces/permissions are attributed by native ancestry, not merely by
 being received on the same app-server connection.
 
+## BTW side conversations
+
+With a compatible Codex runtime, **BTW** in the chat header opens a side panel
+on desktop or a full-screen conversation on mobile/PWA. Choose **New BTW** to
+fork the main conversation's current context without interrupting its task.
+The inherited history is reference material; only new messages in BTW are its
+active instructions. Send a first message in the main conversation before
+creating a BTW.
+
+Terminal `/btw` and `/side` forks created through HAPI appear in the same panel.
+Choose a BTW from the selector to revisit it. Selection and panel visibility
+are local to your browser; other clients stay on their current conversation.
+The back button hides the panel and preserves its draft. **Stop** interrupts
+only that BTW's current turn. **End BTW** ends its temporary native thread and
+keeps its HAPI transcript available across devices.
+
+BTW sends target the side thread directly rather than the main thread's native
+queue. Its model and permissions are inherited at creation. A stopped execution
+or lost native subscription ends the temporary thread; it cannot be cold-resumed
+or forked from persisted Codex history. Create a new BTW from the main
+conversation to continue with fresh context. Upgrade the Hub and all CLI/Runner
+installations together; already-running wrappers retain their original capabilities
+until a new execution starts.
+
 ## Recovery and local data
 
 ### Fork an archived conversation

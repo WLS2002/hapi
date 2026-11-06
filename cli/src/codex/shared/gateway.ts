@@ -19,10 +19,17 @@ export function socketUrl(endpoint: string): string {
     return endpoint.startsWith('unix://') ? `ws+unix://${endpoint.slice(7)}:/` : endpoint;
 }
 
+export type GatewayPeer = {
+    request<T = unknown>(method: string, params?: unknown): Promise<T>;
+    respond(id: string | number, result: unknown): void;
+    retain(): void;
+    release(): void;
+};
 export type GatewayHooks = {
-    before(request: Envelope, connectionId: string): Promise<Envelope>;
+    before(request: Envelope, connectionId: string, peer: GatewayPeer): Promise<Envelope>;
     after(request: Envelope, response: Envelope, connectionId: string): Promise<void | Envelope[]>;
     disconnected?(connectionId: string): void;
+    observe?(message: Envelope, connectionId: string): Promise<void>;
     control(method: string, params: unknown): Promise<unknown>;
 };
 
@@ -54,6 +61,8 @@ export async function startCodexGateway(options: {
         const pending = new Map<string | number, Envelope>();
         const ready = new Promise<void>((resolve, reject) => { upstream.once('open', resolve); upstream.once('error', reject); });
         void ready.catch(() => downstream.close(1011, 'Codex unavailable'));
+        let retained = 0;
+        const internal = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
         let detached = false;
         let finished = false;
         let processing = 0;
@@ -63,12 +72,26 @@ export async function startCodexGateway(options: {
         const finish = () => {
             if (finished) return;
             finished = true; clearTimeout(drainTimer);
+            for (const pending of internal.values()) { clearTimeout(pending.timer); pending.reject(new Error('Codex connection closed; outcome is unconfirmed')); }
+            internal.clear();
             connections.delete(downstream); upstream.close();
             options.hooks.disconnected?.(connectionId);
         };
-        const drained = () => { if (detached && processing === 0 && pending.size === 0) finish(); };
+        const drained = () => { if (detached && retained === 0 && processing === 0 && pending.size === 0 && internal.size === 0) finish(); };
         const send = (target: WebSocket, value: Envelope) => {
             if (target.readyState === WebSocket.OPEN) target.send(JSON.stringify(value));
+        };
+        const peer: GatewayPeer = {
+            request: <T = unknown>(method: string, params?: unknown): Promise<T> => new Promise((resolve, reject) => {
+                if (finished) { reject(new Error('Codex connection is closed')); return; }
+                const id = `hapi-btw:${randomUUID()}`;
+                const timer = setTimeout(() => { internal.delete(id); reject(new Error('Codex request timed out; outcome is unconfirmed')); drained(); }, 60_000);
+                internal.set(id, { resolve: value => resolve(value as T), reject, timer });
+                send(upstream, { id, method, params });
+            }),
+            respond: (id, result) => send(upstream, { id, result }),
+            retain: () => { retained++; clearTimeout(drainTimer); },
+            release: () => { retained = Math.max(0, retained - 1); drained(); },
         };
         downstream.on('message', raw => {
             let message: Envelope;
@@ -84,8 +107,8 @@ export async function startCodexGateway(options: {
                         send(downstream, { id: message.id, result: await options.hooks.control(message.method, message.params) });
                         return;
                     }
-                    const transformed = await options.hooks.before(message, connectionId);
-                    if (transformed.id !== undefined && ['thread/start', 'thread/resume', 'thread/fork', 'thread/archive', 'thread/revert', 'thread/rollback', 'thread/queue/delete'].includes(transformed.method ?? '')) {
+                    const transformed = await options.hooks.before(message, connectionId, peer);
+                    if (transformed.id !== undefined && ['thread/start', 'thread/resume', 'thread/fork', 'thread/archive', 'thread/revert', 'thread/rollback', 'thread/queue/delete', 'thread/unsubscribe'].includes(transformed.method ?? '')) {
                         pending.set(transformed.id, transformed);
                     }
                     send(upstream, transformed);
@@ -95,8 +118,19 @@ export async function startCodexGateway(options: {
             }).catch(() => downstream.close(1011, 'Codex connection failed')).finally(() => { processing--; drained(); });
         });
         upstream.on('message', raw => {
+            let message: Envelope;
+            try { message = EnvelopeSchema.parse(JSON.parse(raw.toString())); }
+            catch { downstream.close(1007, 'Invalid Codex response'); return; }
+            // Lifecycle hooks can await native side controls on this connection.
+            // Their replies must bypass the outgoing lifecycle barrier, like permission answers.
+            if (message.method === undefined && typeof message.id === 'string' && internal.has(message.id)) {
+                const pending = internal.get(message.id)!; internal.delete(message.id); clearTimeout(pending.timer);
+                if (message.error) pending.reject(new Error(string(record(message.error).message) ?? 'Codex request failed'));
+                else pending.resolve(message.result);
+                drained(); return;
+            }
             outgoing = outgoing.then(async () => {
-                const message = EnvelopeSchema.parse(JSON.parse(raw.toString()));
+                if (message.method) await options.hooks.observe?.(message, connectionId);
                 const request = message.method === undefined && message.id !== undefined ? pending.get(message.id) : undefined;
                 let replay: void | Envelope[] = undefined;
                 if (request) {
@@ -121,7 +155,8 @@ export async function startCodexGateway(options: {
             // A terminal can exit after dispatching /new but before its reply.
             // Keep the upstream alive until binding finishes; never lose the
             // new root or treat transport loss as proof the mutation failed.
-            drainTimer = setTimeout(finish, 60_000); drainTimer.unref(); drained();
+            if (retained === 0) { drainTimer = setTimeout(finish, 60_000); drainTimer.unref(); }
+            drained();
         });
     });
     await new Promise<void>((resolve, reject) => {

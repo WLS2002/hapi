@@ -55,6 +55,82 @@ vi.mock('../utils/buildHapiMcpBridge', () => ({ buildHapiMcpBridge: async () => 
 // Explicit opt-in: installed official binary, entirely isolated CODEX_HOME, mock Responses API only.
 describe.skipIf(process.env.HAPI_RUN_SHARED_CODEX_TESTS !== '1')('installed Codex shared runtime', () => {
     afterEach(() => { vi.unstubAllEnvs(); state.sessions.clear(); state.beforeBootstrap = undefined; });
+    it('creates native BTW from web and terminal, isolates questions and preserves the main turn', async () => {
+        const home = await mkdtemp('/tmp/hapi-shared-btw-'); state.home = home;
+        const ch = join(home, 'codex'); const cwd = join(home, 'work'); await mkdir(ch); await mkdir(cwd);
+        const prompts: string[] = [];
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        const http = createServer((request, response) => {
+            const chunks: Buffer[] = [];
+            request.on('data', chunk => chunks.push(Buffer.from(chunk)));
+            request.on('end', () => { void (async () => {
+                if (!request.url?.endsWith('/responses')) { response.writeHead(404).end(); return; }
+                const body = Buffer.concat(chunks).toString(); prompts.push(body);
+                if (body.includes('HOLD_MAIN') && !body.includes('Side conversation boundary')) await gate;
+                if (response.destroyed) return;
+                const id = randomUUID();
+                const events = [{ type: 'response.created', response: { id } },
+                    { type: 'response.output_item.done', item: { type: 'message', role: 'assistant', id: `msg_${id}`, content: [{ type: 'output_text', text: body.includes('Side conversation boundary') ? 'BTW ANSWER' : 'MAIN ANSWER' }] } },
+                    { type: 'response.completed', response: { id, usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } } }];
+                response.writeHead(200, { 'Content-Type': 'text/event-stream' });
+                response.end(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''));
+            })(); });
+        });
+        await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve));
+        const port = (http.address() as { port: number }).port;
+        await writeFile(join(ch, 'config.toml'), `model = "mock-model"\nmodel_provider = "mock_provider"\napproval_policy = "never"\nsandbox_mode = "read-only"\ncheck_for_update_on_startup = false\n[model_providers.mock_provider]\nname = "Isolated mock"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nsupports_websockets = false\nrequest_max_retries = 0\nstream_max_retries = 0\n[analytics]\nenabled = false\n[feedback]\nenabled = false\n[projects."${cwd}"]\ntrust_level = "trusted"\n`);
+        vi.stubEnv('CODEX_HOME', ch);
+        const { runSharedRuntime } = await import('./runtime');
+        let ready!: (value: import('./runtime').RuntimeReady) => void;
+        const readiness = new Promise<import('./runtime').RuntimeReady>(resolve => { ready = resolve; });
+        const abort = new AbortController();
+        const running = runSharedRuntime({ workingDirectory: cwd }, ready, abort.signal);
+        let terminal: CodexAppServerClient | undefined;
+        try {
+            const { sessionId, runtime } = await Promise.race([readiness, running.then(() => { throw new Error('Stopped before ready'); })]);
+            const main = state.sessions.get(sessionId)!;
+            main.user!({ content: { text: 'HOLD_MAIN' } }, 'main-input');
+            await vi.waitFor(() => expect(prompts.length).toBe(1), { timeout: 15_000 });
+            const result = record(await main.rpc.get(RPC_METHODS.CreateBtw)!({}));
+            const side = state.sessions.get(String(result.sessionId))!;
+            expect(side.metadata.codexSideParentId).toBe(sessionId);
+            side.user!({ content: { text: 'SIDE_QUESTION' } }, 'side-input');
+            await vi.waitFor(() => expect(JSON.stringify(side.messages)).toContain('BTW ANSWER'), { timeout: 15_000 });
+            expect(JSON.stringify(main.messages)).not.toContain('BTW ANSWER');
+            expect(JSON.stringify(main.messages)).not.toContain('MAIN ANSWER');
+            side.user!({ content: { text: 'FOLLOWUP' } }, 'side-followup');
+            await vi.waitFor(() => expect(side.consumed).toContain('side-followup'), { timeout: 15_000 });
+            await side.rpc.get(RPC_METHODS.KillSession)!({});
+            expect(side.metadata.codexSideEnded).toBe(true);
+            terminal = new CodexAppServerClient({ endpoint: runtime.endpoint, cwd }); await initializeSharedClient(terminal);
+            const fork = record(await terminal.request('thread/fork', { threadId: main.metadata.codexSessionId, ephemeral: true, excludeTurns: true }));
+            await vi.waitFor(() => expect(main.metadata.codexSideThreads).toHaveLength(2));
+            expect(main.metadata.codexSideThreads?.[1].threadId).toBe(record(fork.thread).id);
+            const terminalSide = state.sessions.get(main.metadata.codexSideThreads![1].sessionId)!;
+            await terminal.request('thread/inject_items', { threadId: record(fork.thread).id,
+                items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Side conversation boundary' }] }] });
+            await terminal.request('turn/start', { threadId: record(fork.thread).id, input: [{ type: 'text', text: 'TERMINAL_SIDE' }] });
+            await vi.waitFor(() => expect(JSON.stringify(terminalSide.messages)).toContain('BTW ANSWER'), { timeout: 5_000 });
+            const discarded = record(await terminal.request('thread/fork', { threadId: main.metadata.codexSessionId, ephemeral: true, excludeTurns: true }));
+            const discardedId = record(discarded.thread).id;
+            const discardedRef = main.metadata.codexSideThreads!.find(side => side.threadId === discardedId)!;
+            const discardedSession = state.sessions.get(discardedRef.sessionId)!;
+            await terminal.request('thread/unsubscribe', { threadId: discardedId });
+            await vi.waitFor(() => expect(discardedSession.metadata.codexSideEnded).toBe(true));
+            await terminal.disconnect(); terminal = undefined;
+            terminalSide.user!({ content: { text: 'AFTER_TERMINAL_CLOSE' } }, 'terminal-closed-input');
+            await vi.waitFor(() => expect(terminalSide.consumed).toContain('terminal-closed-input'), { timeout: 5_000 });
+            await terminalSide.rpc.get(RPC_METHODS.KillSession)!({});
+            expect(terminalSide.metadata.codexSideEnded).toBe(true);
+            release();
+            await vi.waitFor(() => expect(JSON.stringify(main.messages)).toContain('MAIN ANSWER'), { timeout: 15_000 });
+        } finally {
+            release(); await terminal?.disconnect(); abort.abort(); await running.catch(() => {});
+            http.closeAllConnections(); await new Promise<void>(resolve => http.close(() => resolve()));
+            await rm(home, { recursive: true, force: true, maxRetries: 3 });
+        }
+    }, 60_000);
     it('projects native async questions and delivers answers during generation and after completion', async () => {
         const home = await mkdtemp('/tmp/hapi-shared-async-'); state.home = home;
         const ch = join(home, 'codex'); const cwd = join(home, 'work'); await mkdir(ch); await mkdir(cwd);

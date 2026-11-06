@@ -548,6 +548,16 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         return c.json({ ok: true })
     })
 
+    app.post('/sessions/:id/btw', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) return engine
+        const access = requireSessionFromParam(c, engine, { requireActive: true })
+        if (access instanceof Response) return access
+        const result = await engine.createBtw(access.sessionId, c.get('namespace'))
+        if (result.type === 'error') return c.json({ error: result.message }, 409)
+        return c.json({ sessionId: result.sessionId })
+    })
+
     app.post('/sessions/:id/fork', async (c) => {
         const engine = requireSyncEngine(c, getSyncEngine)
         if (engine instanceof Response) {

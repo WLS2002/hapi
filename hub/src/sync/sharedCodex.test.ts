@@ -64,6 +64,33 @@ describe('shared Codex hub binding', () => {
             expect(calls).toBe(1)
         } finally { engine.stop() }
     })
+    it('creates BTW only in the same namespace with a correctly bound ephemeral child', async () => {
+        const { engine, create, rpc } = fixture()
+        try {
+            const source = create('source', { capabilities: { concurrentClients: true, btw: true } })
+            const child = create('side', { codexSideParentId: source.id })
+            const gateway = rpc as RpcGateway & { createBtw(id: string): Promise<{ sessionId: string }> }
+            gateway.createBtw = async () => ({ sessionId: child.id })
+            expect(await engine.createBtw(source.id, 'other')).toMatchObject({ type: 'error' })
+            expect(await engine.createBtw(source.id, 'default')).toEqual({ type: 'success', sessionId: child.id })
+            const unrelated = create('unrelated')
+            gateway.createBtw = async () => ({ sessionId: unrelated.id })
+            expect(await engine.createBtw(source.id, 'default')).toMatchObject({ type: 'error' })
+            expect(await engine.resumeSession(child.id, 'default')).toMatchObject({ type: 'error', code: 'resume_unavailable' })
+        } finally { engine.stop() }
+    })
+    it('ends runner-backed BTW without trying to stop the shared runtime process', async () => {
+        const { engine, create, rpc } = fixture()
+        try {
+            const main = create('main', { startedBy: 'runner', hostPid: 42 })
+            const side = create('side', { startedBy: 'runner', hostPid: 42, codexSideParentId: main.id })
+            rpc.killSession = async () => ({})
+            rpc.stopRunnerSession = async () => { throw new Error('Must not stop the shared process for a side') }
+            await engine.archiveSession(side.id)
+            expect(engine.getSession(side.id)?.active).toBe(false)
+            expect(engine.getSession(main.id)?.active).toBe(true)
+        } finally { engine.stop() }
+    })
     it('guards plan actions by namespace and runtime, leaving stale-plan and retry validation to CLI', async () => {
         const { engine, create, rpc } = fixture()
         try {

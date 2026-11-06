@@ -19,6 +19,12 @@ function makeSession(overrides: Partial<Session> = {}): Session {
 }
 
 describe('sessionResume', () => {
+    it('never resumes a temporary BTW as a persistent native conversation', () => {
+        expect(inactiveSessionCanResume(makeSession({ metadata: {
+            path: '/repo', host: 'machine', flavor: 'codex', codexSessionId: 'ephemeral', codexSideParentId: 'main'
+        } }), 1)).toBe(false)
+    })
+
     it('resolveAgentSessionIdFromMetadata picks the id matching the session flavor', () => {
         expect(resolveAgentSessionIdFromMetadata({
             path: '/p',

@@ -166,6 +166,8 @@ export function SessionHeader(props: {
     onBack: () => void
     onToggleFiles?: () => void
     filesActive?: boolean
+    onToggleBtw?: () => void
+    btwOpen?: boolean
     onToggleOutline?: () => void
     outlineActive?: boolean
     onToggleConciseView?: () => void
@@ -518,6 +520,11 @@ export function SessionHeader(props: {
                             <ConciseViewIcon />
                         </button>
                     ) : null}
+
+                    {props.onToggleBtw ? <button type="button" onClick={props.onToggleBtw}
+                        className={headerToggleClass(props.btwOpen ?? false)} aria-label="BTW" title="BTW" aria-pressed={props.btwOpen ?? false}>
+                        <span className="text-xs font-semibold">BTW</span>
+                    </button> : null}
 
                     {props.onToggleOutline ? (
                         <button

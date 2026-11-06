@@ -1,4 +1,19 @@
 export default {
+  'btw.back': 'Back to main conversation',
+  'btw.conversations': 'BTW conversations',
+  'btw.noConversations': 'No conversations',
+  'btw.new': 'New BTW',
+  'btw.creating': 'Creating…',
+  'btw.createFailed': 'Could not create BTW. Try again.',
+  'btw.emptyTitle': 'Ask alongside your main task',
+  'btw.emptyDescription': 'Create a BTW with the current context. Your main task keeps running.',
+  'btw.ended': 'BTW ended · history is available',
+  'btw.working': 'Working…',
+  'btw.ready': 'Ready',
+  'btw.end': 'End BTW',
+  'btw.ending': 'Ending…',
+  'btw.endDescription': 'End this temporary conversation? Its messages will remain available. The main task keeps running.',
+
   // Loading states
   'loading': 'Loading…',
   'authorizing': 'Authorizing…',

@@ -2195,7 +2195,11 @@ export class SyncEngine {
         const machineId = sessionMeta?.codexResumePending?.machineId ?? sessionMeta?.machineId
         const runnerSpawned = Boolean(sessionMeta?.codexResumePending) || sessionMeta?.startedBy === 'runner'
             || sessionMeta?.startedFromRunner === true
-        if (machineId && runnerSpawned) {
+        if (sessionMeta?.codexSideParentId) {
+            // A BTW owns a native thread subscription, never the shared OS process.
+            // Its KillSession handler waits for interruption/unsubscribe and transcript flush.
+            if (cliUnreachable && !sessionMeta.codexSideEnded) throw new ArchiveCleanupError('unconfirmed')
+        } else if (machineId && runnerSpawned) {
             // Missing Runner acknowledgement leaves cleanup unconfirmed.
             let status = await stopRunner(machineId, sessionId)
             // KillSession acknowledges before cleanupAndExit finishes, and socket
@@ -2491,6 +2495,22 @@ export class SyncEngine {
         if (!child) throw new Error('Invalid shared-runtime clear binding')
         // No superseded-session redirect: only the initiating client navigates.
         return { sessionId: child.id }
+    }
+
+    async createBtw(sessionId: string, namespace: string): Promise<{ type: 'success'; sessionId: string } | { type: 'error'; message: string }> {
+        const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
+        if (!access.ok || !access.session.active || access.session.metadata?.flavor !== 'codex'
+            || !access.session.metadata.capabilities?.btw || access.session.metadata.codexSideParentId) {
+            return { type: 'error', message: 'BTW requires an active Codex main conversation with BTW support' }
+        }
+        try {
+            const result = await this.rpcGateway.createBtw(access.sessionId)
+            const child = await this.validateSharedChild(access.session, result.sessionId)
+            if (!child || child.metadata?.codexSideParentId !== access.sessionId) return { type: 'error', message: 'Invalid BTW session binding' }
+            return { type: 'success', sessionId: child.id }
+        } catch (error) {
+            return { type: 'error', message: error instanceof Error ? error.message : 'Could not create BTW' }
+        }
     }
 
     async implementCodexPlan(sessionId: string, namespace: string, planId: string): Promise<ImplementCodexPlanResult> {
@@ -3592,6 +3612,9 @@ export class SyncEngine {
             }
         }
 
+        if (access.session.metadata?.codexSideParentId) {
+            return { type: 'error', message: 'BTW is temporary and cannot be resumed. Create a new BTW from its main conversation.', code: 'resume_unavailable' }
+        }
         let initialSession = access.session
         if (initialSession.metadata?.codexResumePending) {
             if (!await this.reconcileCodexResume(initialSession)) return { type: 'error', message: 'Codex resume startup is still unconfirmed', code: 'resume_failed', rollbackSafe: false }

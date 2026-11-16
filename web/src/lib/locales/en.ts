@@ -93,6 +93,9 @@ export default {
   'sessions.search.open': 'Search sessions (title, path, Agent, machine name, ID, and more)',
   'sessions.search.clear': 'Clear search',
   'sessions.search.noResults': 'No sessions match your filters.',
+  'sessions.search.scope.default': 'Default',
+  'sessions.search.scope.exclude': 'Exclude',
+  'sessions.search.scope.toggle': 'Search scope',
   'sessions.search.scope.metadata.name': 'Session details',
   'sessions.search.scope.content.name': 'Message text',
   'sessions.search.scope.metadata.description': 'Searching session details: title, summary, path, Agent, machine, ID',
@@ -341,6 +344,8 @@ export default {
   'session.action.copy': 'Copy',
   'session.action.copyReference': 'Copy reference',
   'session.action.fork': 'Fork session',
+  'session.action.forkNoCompleted': 'No completed turn is available to fork.',
+  'dialog.sessionFork.completedDescription': 'Fork through the last completed turn. The running turn is excluded and the source keeps running.',
   'session.action.forkRunning': 'Wait for the current turn to finish before forking this session.',
 
   // Dialogs
@@ -1227,6 +1232,11 @@ export default {
   'settings.about.website': 'Website',
   'settings.about.appVersion': 'App Version',
   'settings.about.protocolVersion': 'Protocol Version',
+  'settings.about.backup.title': 'Settings',
+  'settings.about.backup.description': 'Stored in this browser only.',
+  'settings.about.backup.exportButton': 'Export',
+  'settings.about.backup.importButton': 'Import',
+  'settings.about.backup.importError': 'This file is not a HAPI settings export.',
 
   // Browse / Workspace
   'browse.title': 'Browse',

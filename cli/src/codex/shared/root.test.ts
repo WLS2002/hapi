@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { ApiSessionClient } from '@/api/apiSession';
 import type { AgentState, Metadata } from '@/api/types';
 import type { SessionBootstrapResult } from '@/agent/sessionFactory';
-import { SharedCodexRoot, type RootHost } from './root';
+import { SharedCodexRoot, latestCompletedForkCutoff, type RootHost } from './root';
 import { codexPlanProposalId } from './plan';
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
 import { asyncQuestionsForItem } from './asyncQuestions';
@@ -59,7 +61,7 @@ afterEach(async () => {
 });
 
 async function fixture(opts?: { hubArchived?: boolean; end?: RootHost['end']; create?: RootHost['create'] }) {
-    const directory = await mkdtemp('/tmp/hapi-shared-root-');
+    const directory = await mkdtemp(join(tmpdir(), 'hapi-shared-root-'));
     let state: AgentState = { steeringActive: true };
     let metadata: Metadata = { path: directory, host: 'test', flavor: 'codex' };
     let reconnect: (() => void) | null = null;
@@ -96,6 +98,7 @@ async function fixture(opts?: { hubArchived?: boolean; end?: RootHost['end']; cr
     await root.bind('thread', { model: 'mock', thread: { turns: [] } }, false);
     const native = root.client as unknown as {
         initialized: boolean;
+        settings: Record<string, unknown>;
         thread: { id: string; turns: NativeTurn[] };
         queue: Array<{ id: string; clientUserMessageId: string; input: unknown }>;
         notify(method: string, params: unknown): void;
@@ -104,7 +107,7 @@ async function fixture(opts?: { hubArchived?: boolean; end?: RootHost['end']; cr
         responses: Array<{ id: string | number; result: unknown }>;
     };
     return {
-        root, native, rpc, send, consumed, uncertain, sessionReady, metadata: () => metadata, state: () => state, updateState,
+        session, root, native, rpc, send, consumed, uncertain, sessionReady, metadata: () => metadata, state: () => state, updateState,
         drain: () => (root as unknown as { notifications: Promise<void> }).notifications,
         reconnect: () => reconnect?.(),
         emitHubArchived: () => { for (const listener of hubArchivedListeners) listener(); },
@@ -419,6 +422,121 @@ async function completePlan(f: Awaited<ReturnType<typeof fixture>>, status = 'co
     return codexPlanProposalId('thread', turn.id, 'plan-item');
 }
 
+describe('native settings confirmation', () => {
+    const settings = (mode: 'default' | 'plan') => ({ model: 'mock', effort: 'high',
+        collaborationMode: { mode, settings: { model: 'mock', reasoning_effort: 'high', developer_instructions: 'Native instructions' } } });
+
+    it.each(['default', 'plan'] as const)('activates a resumed %s thread without waiting for a no-op notification', async mode => {
+        const f = await fixture();
+        f.root.acceptSettings(settings(mode));
+        const nativeRequest = f.root.client.request.bind(f.root.client);
+        const request = vi.spyOn(f.root.client, 'request').mockImplementation((method, params) =>
+            method === 'thread/settings/update' ? Promise.resolve({}) : nativeRequest(method, params));
+        vi.useFakeTimers();
+        const activated = f.root.activate({ collaborationMode: mode }).then(() => true, () => false);
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect(await activated).toBe(true);
+        expect(f.sessionReady).toHaveBeenCalledTimes(1);
+        expect(request.mock.calls.some(([method]) => method === 'thread/settings/update')).toBe(false);
+    });
+
+    it('requires a matching notification when the resume snapshot lacks collaboration settings', async () => {
+        const f = await fixture();
+        f.root.acceptSettings({ model: 'mock', effort: 'high', collaborationMode: { mode: 'default' } });
+        vi.spyOn(f.root.client, 'request').mockResolvedValue({});
+        let settled = false;
+        const update = f.root.applySettings({ collaborationMode: 'default' }).then(value => { settled = true; return value; });
+        await Promise.resolve();
+        expect(settled).toBe(false);
+        f.native.notify('thread/settings/updated', { threadId: 'thread', threadSettings: settings('default') });
+        expect((await update).applied).toMatchObject({ collaborationMode: 'default', modelReasoningEffort: 'high' });
+    });
+
+    it('waits for the requested change rather than an unrelated settings notification', async () => {
+        const f = await fixture();
+        f.root.acceptSettings(settings('default'));
+        vi.spyOn(f.root.client, 'request').mockResolvedValue({});
+        let settled = false;
+        const update = f.root.applySettings({ collaborationMode: 'plan' }).then(value => { settled = true; return value; });
+        f.native.notify('thread/settings/updated', { threadId: 'thread', threadSettings: settings('default') });
+        await Promise.resolve();
+        expect(settled).toBe(false);
+        f.native.notify('thread/settings/updated', { threadId: 'thread', threadSettings: settings('plan') });
+        expect((await update).applied.collaborationMode).toBe('plan');
+    });
+
+    it('still times out an actual change that native never confirms', async () => {
+        const f = await fixture();
+        f.root.acceptSettings(settings('default'));
+        vi.spyOn(f.root.client, 'request').mockResolvedValue({});
+        vi.useFakeTimers();
+        const update = f.root.applySettings({ collaborationMode: 'plan' });
+        const rejected = expect(update).rejects.toThrow('Native settings update is not confirmed');
+        await vi.advanceTimersByTimeAsync(15_000);
+        await rejected;
+    });
+
+    it('sends a later settings request even when it matches the snapshot before a pending change', async () => {
+        const f = await fixture();
+        f.root.acceptSettings(settings('default'));
+        vi.useFakeTimers();
+        vi.spyOn(f.root.client, 'request').mockResolvedValue({});
+        const plan = f.root.applySettings({ collaborationMode: 'plan' });
+        let settled = false;
+        const restore = f.root.applySettings({ collaborationMode: 'default' }).then(value => { settled = true; return value; });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(settled).toBe(false);
+        f.native.notify('thread/settings/updated', { threadId: 'thread', threadSettings: settings('plan') });
+        expect((await plan).applied.collaborationMode).toBe('plan');
+        expect(settled).toBe(false);
+        f.native.notify('thread/settings/updated', { threadId: 'thread', threadSettings: settings('default') });
+        expect((await restore).applied.collaborationMode).toBe('default');
+    });
+
+    it('does not reuse the old snapshot after an unconfirmed update times out', async () => {
+        const f = await fixture();
+        f.root.acceptSettings(settings('default'));
+        vi.useFakeTimers();
+        vi.spyOn(f.root.client, 'request').mockResolvedValue({});
+        const failed = expect(f.root.applySettings({ collaborationMode: 'plan' })).rejects.toThrow('Native settings update is not confirmed');
+        await vi.advanceTimersByTimeAsync(15_000);
+        await failed;
+        // An unrelated native observation does not settle the timed-out plan operation.
+        f.native.notify('thread/settings/updated', { threadId: 'thread', threadSettings: settings('default') });
+        let settled = false;
+        const restore = f.root.applySettings({ collaborationMode: 'default' }).then(value => { settled = true; return value; });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(settled).toBe(false);
+        f.native.notify('thread/settings/updated', { threadId: 'thread', threadSettings: settings('plan') });
+        expect(settled).toBe(false);
+        f.native.notify('thread/settings/updated', { threadId: 'thread', threadSettings: settings('default') });
+        expect((await restore).applied.collaborationMode).toBe('default');
+    });
+
+    it('allows confirmed no-op settings again after native reconnect revalidates the thread', async () => {
+        const f = await fixture();
+        f.native.settings = settings('default');
+        f.root.acceptSettings(settings('default'));
+        const nativeRequest = f.root.client.request.bind(f.root.client);
+        vi.spyOn(f.root.client, 'request').mockImplementation((method, params) =>
+            method === 'thread/settings/update' ? Promise.reject(new Error('Native outcome unknown')) : nativeRequest(method, params));
+        await expect(f.root.applySettings({ collaborationMode: 'plan' })).rejects.toThrow('Native outcome unknown');
+        f.native.thread.turns = [{ id: 'running', status: 'inProgress', items: [] }];
+        f.native.initialized = false;
+        f.native.abandoned();
+        await vi.waitFor(() => expect(f.state().steeringActive).toBe(true));
+        expect((await f.root.applySettings({ collaborationMode: 'default' })).applied.collaborationMode).toBe('default');
+    });
+
+    it('does not confirm a disconnected client from its cached settings', async () => {
+        const f = await fixture();
+        f.root.acceptSettings(settings('default'));
+        f.native.initialized = false;
+        vi.spyOn(f.root.client, 'request').mockRejectedValue(new Error('Native disconnected'));
+        await expect(f.root.applySettings({ collaborationMode: 'default' })).rejects.toThrow('Native disconnected');
+    });
+});
+
 describe('shared permission modes', () => {
     it('switches native auto-review on and back to the human reviewer', async () => {
         const f = await fixture();
@@ -636,3 +754,137 @@ describe('shared steering availability', () => {
         await vi.waitFor(() => expect(end).toHaveBeenCalledTimes(1));
     });
 });
+
+describe('latest completed list fork', () => {
+    it('uses an inclusive fixed cutoff while later source turns advance', async () => {
+        const initialSettings = vi.fn(async () => {});
+        const create = vi.fn<RootHost['create']>(async (_method, params) => {
+            expect(params).toMatchObject({ threadId: 'thread', lastTurnId: 'two' });
+            expect(params).not.toHaveProperty('beforeTurnId');
+            f.native.thread.turns.push({ id: 'later', status: 'inProgress', items: [] });
+            return { threadId: 'child', session: { sessionId: 'child-session' }, initialSettings,
+                readThread: async () => ({ turns: f.native.thread.turns.slice(0, 2) }) } as unknown as SharedCodexRoot;
+        });
+        const f = await fixture({ create });
+        f.native.thread.turns = [
+            { id: 'one', status: 'completed', items: [{ id: 'u1', type: 'userMessage', clientId: 'first' }] },
+            { id: 'two', status: 'completed', items: [{ id: 'u2', type: 'userMessage', clientId: 'second' }] },
+            { id: 'three', status: 'inProgress', items: [{ id: 'u3', type: 'userMessage', clientId: 'running' }] }
+        ];
+        await f.root.refresh(); await f.root.activate();
+        expect(f.metadata().capabilities?.conversationHistory?.forkLatestCompleted).toBe(true);
+        const request = vi.spyOn(f.root.client, 'request');
+        await expect(f.rpc.get(RPC_METHODS.ForkConversation)!({ latestCompleted: true })).resolves.toEqual({
+            nativeSessionId: 'child', sessionId: 'child-session', completedTurnId: 'two'
+        });
+        expect(create).toHaveBeenCalledTimes(1);
+        expect(f.state().steeringActive).toBe(true);
+        expect(request.mock.calls.some(([method]) => method === 'turn/interrupt')).toBe(false);
+    });
+    it('refuses empty, unknown and mixed boundary requests before mutation', async () => {
+        const create = vi.fn<RootHost['create']>();
+        const f = await fixture({ create }); await f.root.activate();
+        const fork = f.rpc.get(RPC_METHODS.ForkConversation)!;
+        await expect(fork({ latestCompleted: true })).rejects.toThrow('No completed');
+        f.native.thread.turns = [{ id: 'bad', status: 'unknown', items: [] }];
+        await expect(fork({ latestCompleted: true })).rejects.toThrow('prefix');
+        await expect(fork({ latestCompleted: true, messageLocalId: 'first' })).rejects.toThrow();
+        expect(create).not.toHaveBeenCalled();
+    });
+});
+
+describe('completed native prefix validation', () => {
+    it('rejects duplicate or unknown native turn identities and states', () => {
+        expect(() => latestCompletedForkCutoff([{ id: 'one', status: 'completed' }, { id: 'one', status: 'inProgress' }])).toThrow('ambiguous');
+        expect(() => latestCompletedForkCutoff([{ id: 'one', status: 'unknown' }, { id: 'two', status: 'completed' }])).toThrow('prefix');
+        expect(() => latestCompletedForkCutoff([{ status: 'completed' }])).toThrow('ambiguous');
+    });
+    it('uses the last completed turn and excludes a failed trailing turn', () => {
+        expect(latestCompletedForkCutoff([{ id: 'one', status: 'completed' }, { id: 'two', status: 'failed' }, { id: 'three', status: 'inProgress' }])).toBe('one');
+        expect(latestCompletedForkCutoff([{ id: 'one', status: 'completed' }, { id: 'two', status: 'completed' }])).toBe('two');
+    });
+});
+
+it('closes a native child whose inherited prefix does not match the requested cutoff', async () => {
+    const child = { threadId: 'wrong-child', session: { sessionId: 'wrong-session' },
+        readThread: async () => ({ turns: [{ id: 'one' }, { id: 'running' }] }) } as unknown as SharedCodexRoot;
+    const end = vi.fn(async () => {});
+    const create = vi.fn<RootHost['create']>(async () => child);
+    const f = await fixture({ create, end });
+    f.native.thread.turns = [{ id: 'one', status: 'completed', items: [] }, { id: 'running', status: 'inProgress', items: [] }];
+    await f.root.refresh(); await f.root.activate();
+    await expect(f.rpc.get(RPC_METHODS.ForkConversation)!({ latestCompleted: true })).rejects.toThrow('does not match');
+    expect(end).toHaveBeenCalledWith(child);
+    expect(f.state().steeringActive).toBe(true);
+});
+
+describe('completed fork capability snapshot races', () => {
+    it('ignores an in-progress snapshot returned after completion and the next turn start', async () => {
+        const f = await fixture();
+        f.native.thread.turns = [{ id: 'one', status: 'inProgress', items: [] }];
+        await f.root.refresh();
+        const snapshot = structuredClone(f.native.thread);
+        let release!: () => void;
+        const read = vi.spyOn(f.root, 'readThread').mockImplementationOnce(async () => {
+            await new Promise<void>(resolve => { release = resolve; });
+            return snapshot;
+        });
+        const refresh = f.root.refresh();
+        await vi.waitFor(() => expect(release).toBeDefined());
+        f.native.notify('turn/completed', { threadId: 'thread', turn: { id: 'one', status: 'completed' } });
+        f.native.notify('turn/started', { threadId: 'thread', turn: { id: 'two', status: 'inProgress' } });
+        await f.drain();
+        expect(f.metadata().capabilities?.conversationHistory?.forkLatestCompleted).toBe(true);
+        release(); await refresh; read.mockRestore();
+        expect(f.metadata().capabilities?.conversationHistory?.forkLatestCompleted).toBe(true);
+        expect(f.state().steeringActive).toBe(true);
+    });
+    it('rechecks the revision when a queued snapshot metadata updater executes', async () => {
+        const f = await fixture();
+        f.native.thread.turns = [{ id: 'one', status: 'completed', items: [] }];
+        await f.root.refresh();
+        f.native.thread.turns = [{ id: 'two', status: 'inProgress', items: [] }];
+        const original = f.session.updateMetadata.bind(f.session);
+        let delayed: Parameters<ApiSessionClient['updateMetadata']>[0] | undefined;
+        const update = vi.spyOn(f.session, 'updateMetadata').mockImplementation(fn => {
+            if (!delayed) { delayed = fn; return; }
+            return original(fn);
+        });
+        await f.root.refresh();
+        expect(delayed).toBeDefined();
+        update.mockRestore();
+        f.native.notify('turn/completed', { threadId: 'thread', turn: { id: 'two', status: 'completed' } });
+        f.native.notify('turn/started', { threadId: 'thread', turn: { id: 'three', status: 'inProgress' } });
+        await f.drain();
+        original(delayed!);
+        expect(f.metadata().capabilities?.conversationHistory?.forkLatestCompleted).toBe(true);
+    });
+});
+
+for (const queued of [false, true]) {
+    it(`retains completed-history discovery when only turn/start intervenes (${queued ? 'queued updater' : 'delayed read'})`, async () => {
+        const f = await fixture();
+        expect(f.metadata().capabilities?.conversationHistory?.forkLatestCompleted).toBe(false);
+        f.native.thread.turns = [{ id: 'historical', status: 'completed', items: [] }];
+        const original = f.session.updateMetadata.bind(f.session);
+        let delayed: Parameters<ApiSessionClient['updateMetadata']>[0] | undefined;
+        let release!: () => void;
+        const spy = queued ? vi.spyOn(f.session, 'updateMetadata').mockImplementation(fn => {
+            if (!delayed) { delayed = fn; return; }
+            return original(fn);
+        }) : vi.spyOn(f.root, 'readThread').mockImplementationOnce(async () => {
+            await new Promise<void>(resolve => { release = resolve; });
+            return { turns: [{ id: 'historical', status: 'completed', items: [] }] };
+        });
+        const refresh = f.root.refresh();
+        if (queued) await refresh;
+        else await vi.waitFor(() => expect(release).toBeDefined());
+        spy.mockRestore();
+        f.native.notify('turn/started', { threadId: 'thread', turn: { id: 'next', status: 'inProgress' } });
+        await f.drain();
+        if (queued) original(delayed!);
+        else { release(); await refresh; }
+        expect(f.metadata().capabilities?.conversationHistory?.forkLatestCompleted).toBe(true);
+        expect(f.state().steeringActive).toBe(true);
+    });
+}

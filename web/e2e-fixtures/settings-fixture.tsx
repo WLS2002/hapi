@@ -15,6 +15,7 @@ import { I18nProvider } from '../src/lib/i18n-context'
 import SettingsLayout from '../src/routes/settings/layout'
 import SettingsHubPage from '../src/routes/settings'
 import SettingsDisplayPage from '../src/routes/settings/display'
+import SettingsAboutPage from '../src/routes/settings/about'
 
 const rootRoute = createRootRoute({
     component: () => <Outlet />,
@@ -38,13 +39,19 @@ const settingsDisplayRoute = createRoute({
     component: SettingsDisplayPage,
 })
 
+const settingsAboutRoute = createRoute({
+    getParentRoute: () => settingsRoute,
+    path: 'about',
+    component: SettingsAboutPage,
+})
+
 const routeTree = rootRoute.addChildren([
-    settingsRoute.addChildren([settingsIndexRoute, settingsDisplayRoute]),
+    settingsRoute.addChildren([settingsIndexRoute, settingsDisplayRoute, settingsAboutRoute]),
 ])
 
 const router = createRouter({
     routeTree,
-    history: createMemoryHistory({ initialEntries: ['/settings'] }),
+    history: createMemoryHistory({ initialEntries: [new URLSearchParams(location.search).get('page') === 'about' ? '/settings/about' : '/settings'] }),
 })
 
 declare module '@tanstack/react-router' {

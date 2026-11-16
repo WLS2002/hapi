@@ -93,6 +93,9 @@ export default {
   'sessions.search.open': '搜索会话（支持标题、路径、Agent、机器名、ID 等信息）',
   'sessions.search.clear': '清除搜索',
   'sessions.search.noResults': '没有符合筛选条件的会话。',
+  'sessions.search.scope.default': '默认',
+  'sessions.search.scope.exclude': '排除',
+  'sessions.search.scope.toggle': '搜索范围',
   'sessions.search.scope.metadata.name': '会话信息',
   'sessions.search.scope.content.name': '消息正文',
   'sessions.search.scope.metadata.description': '搜索会话信息：标题、摘要、路径、Agent、机器名、ID',
@@ -341,6 +344,8 @@ export default {
   'session.action.copy': '复制',
   'session.action.copyReference': '复制引用',
   'session.action.fork': '分叉会话',
+  'session.action.forkNoCompleted': '暂无已完成轮次可分叉。',
+  'dialog.sessionFork.completedDescription': '分叉到最后一个已完成轮次，不包含正在进行的轮次，原会话继续运行。',
   'session.action.forkRunning': '当前轮次完成后才能分叉此会话。',
 
   // Dialogs
@@ -1224,6 +1229,11 @@ export default {
   'settings.about.website': '官方网站',
   'settings.about.appVersion': '应用版本',
   'settings.about.protocolVersion': '协议版本',
+  'settings.about.backup.title': '设置',
+  'settings.about.backup.description': '仅保存在当前浏览器。',
+  'settings.about.backup.exportButton': '导出',
+  'settings.about.backup.importButton': '导入',
+  'settings.about.backup.importError': '此文件不是 HAPI 设置导出文件。',
 
   // Browse / Workspace
   'browse.title': '浏览',

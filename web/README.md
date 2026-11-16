@@ -78,6 +78,7 @@ The Hub persists and enforces the lock across clients, restarts, and resume.
 - Message thread with infinite scroll.
 - Concise view (header toggle or `/settings/chat`, per device): shows only user input and each round's final reply (`src/chat/conciseView.ts`). Permission requests, questions, plan proposals, user shell commands, and errors stay visible; the full thread returns while a search target is active.
 - Composer for sending messages.
+- Composer send shortcut: Alt+S (independent of the Enter behavior setting).
 - Permission mode and model selection for supported agents.
   Cursor Auto uses CLI Auto for new/resumed sessions configured with Auto. Switching a live session to Auto when ACP does not advertise a literal Auto option relaunches the Cursor ACP process in place under `--model auto` while preserving the hub session id.
 - Session abort and handoff controls.
@@ -138,6 +139,12 @@ Optional, not a requirement for every feature or a reason to expand a bug fix.
 - The FUE dot and feature-specific badges/counters are mutually exclusive; onboarding wins until acknowledged.
 - Opt in per feature; skip the wrapper if an upstream component already supplies onboarding.
 - Working example: `ScratchlistToggleButton` in `src/components/AssistantChat/ComposerButtons.tsx`. Use the source rather than maintaining a copied example here.
+
+### Browser settings export/import
+
+Settings → About exports and imports browser-local settings as JSON. Only keys in `SETTINGS_STORAGE_KEYS` (`src/lib/settingsTransfer.ts`) move; import replaces them and reloads.
+
+A new `hapi*` localStorage key must be classified: in `SETTINGS_STORAGE_KEYS` if the user chose it to configure the app and it makes sense in another browser on the same hub, otherwise in `NOT_SETTINGS_KEYS` (`src/lib/settingsTransfer.test.ts`). Data, drafts, last-used values, per-session or per-path UI state, dismissals, device-bound state, credentials, and trust grants are not settings. The test fails on unclassified keys.
 
 ## Authentication
 

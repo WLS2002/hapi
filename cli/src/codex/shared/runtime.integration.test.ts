@@ -17,13 +17,13 @@ import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
 const state = vi.hoisted(() => ({ home: '', sessions: new Map<string, MockSession>(), beforeBootstrap: undefined as (() => Promise<void>) | undefined }));
 const BOOTSTRAP_START_MARKER = vi.hoisted(() => 'Tue Sep 29 09:00:00 2026');
 class MockSession extends EventEmitter {
-    readonly sessionId = randomUUID();
+    readonly sessionId: string;
     state: AgentState = { requests: { 'old-worker': { tool: 'request_user_input', arguments: {}, createdAt: 0 } } }; metadata: Metadata;
     messages: unknown[] = []; consumed: string[] = []; dead = false;
     user?: (message: { content: { text: string } }, id?: string) => void;
     rpc = new Map<string, (params: unknown) => Promise<unknown>>();
     rpcHandlerManager = { registerHandler: (name: string, fn: (params: unknown) => Promise<unknown>) => { this.rpc.set(name, fn); } };
-    constructor(cwd: string) { super(); this.metadata = { path: cwd, host: 'test', hostPid: process.pid, machineId: 'test', flavor: 'codex', capabilities: { concurrentClients: true } }; }
+    constructor(cwd: string, sessionId: string = randomUUID()) { super(); this.sessionId = sessionId; this.metadata = { path: cwd, host: 'test', hostPid: process.pid, machineId: 'test', flavor: 'codex', capabilities: { concurrentClients: true } }; }
     getMetadata() { return this.metadata; }
     updateMetadata(fn: (m: Metadata) => Metadata) { this.metadata = fn(this.metadata); }
     updateAgentState(fn: (s: AgentState) => AgentState) { this.state = fn(this.state); }
@@ -40,21 +40,90 @@ class MockSession extends EventEmitter {
 }
 vi.mock('@/configuration', () => ({ configuration: { get happyHomeDir() { return state.home; }, apiUrl: 'http://mock-hub', cliApiToken: 'test' } }));
 vi.mock('@/ui/logger', () => ({ logger: { debug: (...args: unknown[]) => { if (process.env.HAPI_DEBUG_SHARED_TEST) console.log(...args); }, warn: vi.fn(), info: vi.fn(), debugLargeJson: vi.fn() } }));
-vi.mock('@/agent/sessionFactory', () => ({ bootstrapSession: async (options: { workingDirectory: string; metadataOverrides: Partial<Metadata> }) => {
+async function bootstrapMockSession(options: { workingDirectory: string; metadataOverrides?: Partial<Metadata>; sessionId?: string }) {
     await state.beforeBootstrap?.();
-    const session = new MockSession(options.workingDirectory); session.metadata = { ...session.metadata, ...options.metadataOverrides };
+    const session = new MockSession(options.workingDirectory, options.sessionId); session.metadata = { ...session.metadata, ...options.metadataOverrides };
     state.sessions.set(session.sessionId, session);
-    // session.getMetadata() is the hub's view; a hub without the field strips
-    // hostStartMarker, so only the local bootstrap metadata still carries it.
-    return { session: session as unknown as ApiSessionClient, sessionInfo: { id: session.sessionId, namespace: 'test' }, metadata: { ...session.metadata, hostStartMarker: BOOTSTRAP_START_MARKER },
+    // The Hub may strip hostStartMarker; the local bootstrap retains it.
+    return { session: session as unknown as ApiSessionClient, sessionInfo: { id: session.sessionId, namespace: 'test' },
+        metadata: { ...session.metadata, hostStartMarker: BOOTSTRAP_START_MARKER },
         workingDirectory: options.workingDirectory, machineId: 'test', startedBy: 'terminal', api: {} };
-}, bootstrapExistingSession: vi.fn() }));
+}
+vi.mock('@/agent/sessionFactory', () => ({ bootstrapSession: bootstrapMockSession, bootstrapExistingSession: vi.fn(bootstrapMockSession) }));
 vi.mock('@/runner/controlClient', () => ({ notifyRunnerSessionStarted: vi.fn(async () => ({})) }));
 vi.mock('../utils/buildHapiMcpBridge', () => ({ buildHapiMcpBridge: async () => ({ server: { url: 'http://unused', stop() {} }, mcpServers: {} }) }));
 
 // Explicit opt-in: installed official binary, entirely isolated CODEX_HOME, mock Responses API only.
 describe.skipIf(process.env.HAPI_RUN_SHARED_CODEX_TESTS !== '1')('installed Codex shared runtime', () => {
     afterEach(() => { vi.unstubAllEnvs(); state.sessions.clear(); state.beforeBootstrap = undefined; });
+    it('cold resumes confirmed settings and repeats mode changes without waiting for no-op notifications', async () => {
+        const home = await mkdtemp('/tmp/hapi-shared-settings-'); state.home = home;
+        const ch = join(home, 'codex'); const cwd = join(home, 'work'); await mkdir(ch); await mkdir(cwd);
+        let modelRequests = 0;
+        let release: (() => void) | undefined;
+        const http = createServer((request, response) => {
+            const chunks: Buffer[] = [];
+            request.on('data', chunk => chunks.push(Buffer.from(chunk)));
+            request.on('end', () => {
+                modelRequests++;
+                const id = randomUUID();
+                const events = [{ type: 'response.created', response: { id } },
+                    { type: 'response.output_item.done', item: { type: 'message', role: 'assistant', id: `msg_${id}`, content: [{ type: 'output_text', text: 'SETTINGS HISTORY' }] } },
+                    { type: 'response.completed', response: { id, usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } }];
+                response.writeHead(200, { 'Content-Type': 'text/event-stream' });
+                const finish = () => response.end(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''));
+                if (Buffer.concat(chunks).toString().includes('HOLD FORK SOURCE')) release = finish;
+                else finish();
+            });
+        });
+        await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve));
+        const port = (http.address() as { port: number }).port;
+        await writeFile(join(ch, 'config.toml'), `model = "mock-model"\nmodel_reasoning_effort = "high"\nmodel_provider = "mock_provider"\napproval_policy = "never"\nsandbox_mode = "read-only"\n[model_providers.mock_provider]\nname = "Isolated mock"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nsupports_websockets = false\nrequest_max_retries = 0\nstream_max_retries = 0\n[analytics]\nenabled = false\n[feedback]\nenabled = false\n[projects."${cwd}"]\ntrust_level = "trusted"\n`);
+        vi.stubEnv('CODEX_HOME', ch); vi.stubEnv('HOME', home);
+        const { runSharedRuntime } = await import('./runtime');
+        let threadId: string | undefined;
+        let sessionId: string | undefined;
+        try {
+            for (const cold of [false, true]) {
+                const abort = new AbortController();
+                let ready!: (value: import('./runtime').RuntimeReady) => void;
+                const readiness = new Promise<import('./runtime').RuntimeReady>(resolve => { ready = resolve; });
+                const running = runSharedRuntime({ workingDirectory: cwd, ...(cold ? { resumeSessionId: threadId, collaborationMode: 'default' as const } : {}) }, ready, abort.signal);
+                try {
+                    const execution = await Promise.race([readiness, running.then(() => { throw new Error('Runtime stopped before ready'); })]);
+                    const web = state.sessions.get(execution.sessionId)!;
+                    if (cold) {
+                        expect(execution.sessionId).toBe(sessionId);
+                        expect(web.metadata.codexSessionId).toBe(threadId);
+                        expect(modelRequests).toBe(1);
+                    } else {
+                        sessionId = execution.sessionId; threadId = web.metadata.codexSessionId;
+                        web.user?.({ content: { text: 'MATERIALIZE HISTORY' } }, 'history-input');
+                        await vi.waitFor(() => expect(web.messages).toContainEqual(expect.objectContaining({ type: 'message', message: 'SETTINGS HISTORY' })), { timeout: 15_000 });
+                    }
+                    for (const mode of ['default', 'default', 'plan', 'plan', 'default'] as const) {
+                        expect(await web.rpc.get(RPC_METHODS.SetSessionConfig)!({ collaborationMode: mode }))
+                            .toMatchObject({ applied: { collaborationMode: mode } });
+                    }
+                    if (cold) {
+                        web.user?.({ content: { text: 'HOLD FORK SOURCE' } }, 'running-input');
+                        await vi.waitFor(() => { expect(release).toBeDefined(); expect(web.state.steeringActive).toBe(true); });
+                        const fork = record(await web.rpc.get(RPC_METHODS.ForkConversation)!({ latestCompleted: true }));
+                        expect(fork.sessionId).not.toBe(sessionId);
+                        expect(fork.completedTurnId).toEqual(expect.any(String));
+                        expect(state.sessions.get(String(fork.sessionId))?.metadata.codexSessionId).toBe(fork.nativeSessionId);
+                        expect(web.state.steeringActive).toBe(true);
+                        expect(modelRequests).toBe(2);
+                        release!();
+                        await vi.waitFor(() => expect(web.state.steeringActive).toBe(false));
+                    }
+                } finally { release?.(); abort.abort(); await running.catch(() => {}); }
+            }
+        } finally {
+            await new Promise<void>(resolve => http.close(() => resolve()));
+            await rm(home, { recursive: true, force: true, maxRetries: 3 });
+        }
+    }, 60_000);
     it('creates native BTW from web and terminal, isolates questions and preserves the main turn', async () => {
         const home = await mkdtemp('/tmp/hapi-shared-btw-'); state.home = home;
         const ch = join(home, 'codex'); const cwd = join(home, 'work'); await mkdir(ch); await mkdir(cwd);

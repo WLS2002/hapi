@@ -304,6 +304,8 @@ export default {
   'session.action.copy': 'Копировать',
   'session.action.copyReference': 'Копировать ссылку',
   'session.action.fork': 'Форк сессии',
+  'session.action.forkNoCompleted': 'Нет завершённых ходов для создания ветки.',
+  'dialog.sessionFork.completedDescription': 'Создать ветку до последнего завершённого хода. Текущий ход исключён; исходная сессия продолжит работу.',
   'session.action.forkRunning': 'Дождитесь завершения текущего хода, прежде чем создавать форк.',
 
   // Диалоги
@@ -1159,6 +1161,11 @@ export default {
   'settings.about.website': 'Сайт',
   'settings.about.appVersion': 'Версия приложения',
   'settings.about.protocolVersion': 'Версия протокола',
+  'settings.about.backup.title': 'Настройки',
+  'settings.about.backup.description': 'Хранятся только в этом браузере.',
+  'settings.about.backup.exportButton': 'Экспорт',
+  'settings.about.backup.importButton': 'Импорт',
+  'settings.about.backup.importError': 'Этот файл не является экспортом настроек HAPI.',
 
   // Обзор / Рабочее пространство
   'browse.title': 'Обзор',
